@@ -319,6 +319,7 @@ var import_path7 = require("path");
 
 // src/team/tmux-session.ts
 var import_fs3 = require("fs");
+var import_crypto2 = require("crypto");
 var import_child_process3 = require("child_process");
 var import_util2 = require("util");
 var import_path5 = require("path");
@@ -1142,7 +1143,7 @@ function getLogPath(workingDirectory, teamName) {
 function logAuditEvent(workingDirectory, event) {
   const logPath = getLogPath(workingDirectory, event.teamName);
   const dir = (0, import_node_path.join)(getOmcRoot(workingDirectory), "logs");
-  validateResolvedPath(logPath, workingDirectory);
+  validateResolvedPath(logPath, dir);
   ensureDirWithMode(dir);
   const line = JSON.stringify(event) + "\n";
   appendFileWithMode(logPath, line);
@@ -1373,7 +1374,7 @@ function getUsageLogPath(workingDirectory, teamName) {
 function recordTaskUsage(workingDirectory, teamName, record) {
   const logPath = getUsageLogPath(workingDirectory, teamName);
   const dir = (0, import_node_path3.join)(getOmcRoot(workingDirectory), "logs");
-  validateResolvedPath(logPath, workingDirectory);
+  validateResolvedPath(logPath, dir);
   ensureDirWithMode(dir);
   appendFileWithMode(logPath, JSON.stringify(record) + "\n");
 }

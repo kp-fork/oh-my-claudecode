@@ -6,6 +6,7 @@
  * Sessions are named "omc-team-{teamName}-{workerName}".
  */
 import { existsSync } from 'fs';
+import { createHash } from 'crypto';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { join, basename, isAbsolute, win32 } from 'path';
@@ -195,6 +196,80 @@ export function buildWorkerLaunchSpec(shellPath) {
         return { shell: bash.shell, rcFile: bashRc };
     // Final fallback
     return { shell: '/bin/sh', rcFile: null };
+}
+function commandFingerprint(value) {
+    return createHash('sha256').update(value).digest('hex').slice(0, 12);
+}
+function redactWorkerStartCommandForLog(command) {
+    return command
+        // POSIX env assignments in the generated launch command.
+        .replace(/\b([A-Za-z_][A-Za-z0-9_]*)='[^']*'/g, "$1='<redacted>'")
+        // Windows cmd env assignments.
+        .replace(/set "([A-Za-z_][A-Za-z0-9_]*)=[^"]*"/g, 'set "$1=<redacted>"')
+        // PowerShell env assignments.
+        .replace(/\$env:([A-Za-z_][A-Za-z0-9_]*)='[^']*'/g, "$env:$1='<redacted>'")
+        // Sensitive CLI flags that may appear in launchArgs.
+        .replace(/(--?[A-Za-z0-9_-]*(?:api[-_]?key|token|secret|password|credential|auth)[A-Za-z0-9_-]*)(?:=|\s+)(?:'[^']*'|"[^"]*"|\S+)/gi, '$1=<redacted>');
+}
+function workerStartCommandPreview(command, maxLength = 180) {
+    const redacted = redactWorkerStartCommandForLog(command).replace(/\s+/g, ' ').trim();
+    return redacted.length > maxLength ? `${redacted.slice(0, maxLength)}…` : redacted;
+}
+function logWorkerSpawnDiagnostic(message) {
+    process.stderr.write(`[team/tmux-session] ${message}\n`);
+}
+function paneCurrentCommandLooksReady(command) {
+    const normalized = basename(command.replace(/\\/g, '/')).replace(/\.(exe|cmd|bat)$/i, '').toLowerCase();
+    return SUPPORTED_POSIX_SHELLS.has(normalized)
+        || ['cmd', 'powershell', 'pwsh', 'nu', 'elvish'].includes(normalized);
+}
+async function waitForShellReady(paneId, opts = {}) {
+    if (isCmuxSurfaceTarget(paneId))
+        return true;
+    const envTimeout = Number.parseInt(process.env.OMC_TEAM_SHELL_READY_TIMEOUT_MS ?? '', 10);
+    const timeoutMs = Number.isFinite(opts.timeoutMs) && (opts.timeoutMs ?? 0) > 0
+        ? Number(opts.timeoutMs)
+        : (Number.isFinite(envTimeout) && envTimeout > 0 ? envTimeout : 5_000);
+    const pollIntervalMs = Number.isFinite(opts.pollIntervalMs) && (opts.pollIntervalMs ?? 0) > 0
+        ? Number(opts.pollIntervalMs)
+        : 50;
+    const deadline = Date.now() + timeoutMs;
+    let lastStatus = '';
+    while (Date.now() < deadline) {
+        try {
+            const result = await tmuxCmdAsync([
+                'display-message', '-p', '-t', paneId,
+                '#{pane_dead} #{pane_current_command}',
+            ], { timeout: 1000 });
+            lastStatus = result.stdout.trim();
+            const [dead, ...commandParts] = lastStatus.split(/\s+/);
+            if (dead === '1')
+                return false;
+            const currentCommand = commandParts.join(' ');
+            if (currentCommand && paneCurrentCommandLooksReady(currentCommand)) {
+                return true;
+            }
+        }
+        catch (error) {
+            lastStatus = error instanceof Error ? error.message : String(error);
+        }
+        await sleep(pollIntervalMs);
+    }
+    logWorkerSpawnDiagnostic(`worker shell readiness timed out pane=${paneId} timeoutMs=${timeoutMs} lastStatus=${JSON.stringify(lastStatus)}`);
+    return false;
+}
+async function verifyWorkerStartCommandDelivered(paneId, startCmd) {
+    if (isCmuxSurfaceTarget(paneId))
+        return true;
+    const expected = normalizeTmuxCapture(startCmd);
+    for (let attempt = 1; attempt <= 5; attempt++) {
+        const captured = await capturePaneAsync(paneId, { joinWrappedLines: true });
+        if (normalizeTmuxCapture(captured).includes(expected)) {
+            return true;
+        }
+        await sleep(50);
+    }
+    return false;
 }
 function escapeForCmdSet(value) {
     return value.replace(/"/g, '""');
@@ -576,7 +651,6 @@ export async function createTeamSession(teamName, workerCount, cwd, options = {}
                 catch { /* ignore */ }
             }
         }
-        await new Promise(r => setTimeout(r, 300));
         return { sessionName: teamTarget, leaderPaneId, workerPaneIds, sessionMode };
     }
     // Create worker panes: first via horizontal split off leader, rest stacked vertically on right.
@@ -611,7 +685,7 @@ export async function createTeamSession(teamName, workerCount, cwd, options = {}
             catch { /* ignore */ }
         }
     }
-    await new Promise(r => setTimeout(r, 300));
+    await Promise.all(workerPaneIds.map((workerPaneId) => waitForShellReady(workerPaneId, { timeoutMs: 5_000 })));
     return { sessionName: teamTarget, leaderPaneId, workerPaneIds, sessionMode };
 }
 /**
@@ -622,26 +696,74 @@ export async function createTeamSession(teamName, workerCount, cwd, options = {}
 export async function spawnWorkerInPane(sessionName, paneId, config) {
     validateTeamName(config.teamName);
     const startCmd = buildWorkerStartCommand(config);
+    const fingerprint = commandFingerprint(startCmd);
+    const preview = workerStartCommandPreview(startCmd);
+    logWorkerSpawnDiagnostic(`worker start delivery begin session=${sessionName} pane=${paneId} ` +
+        `worker=${config.workerName} cmdSha=${fingerprint} cmdPreview=${JSON.stringify(preview)}`);
     if (isCmuxSurfaceTarget(paneId)) {
-        await cmuxSendSurface(paneId, startCmd);
-        await cmuxSendSurfaceKey(paneId, 'Enter');
-        return;
+        try {
+            await cmuxSendSurface(paneId, startCmd);
+            await cmuxSendSurfaceKey(paneId, 'Enter');
+            logWorkerSpawnDiagnostic(`worker start delivery sent session=${sessionName} pane=${paneId} ` +
+                `worker=${config.workerName} cmdSha=${fingerprint} sendStatus=0`);
+            return;
+        }
+        catch (error) {
+            logWorkerSpawnDiagnostic(`worker start delivery failed session=${sessionName} pane=${paneId} ` +
+                `worker=${config.workerName} cmdSha=${fingerprint} sendStatus=1 error=${JSON.stringify(error instanceof Error ? error.message : String(error))}`);
+            throw error;
+        }
     }
-    // Use -l (literal) flag to prevent tmux key-name parsing of the command string
-    await tmuxExecAsync([
-        'send-keys', '-t', paneId, '-l', startCmd
-    ]);
-    await tmuxExecAsync(['send-keys', '-t', paneId, 'Enter']);
+    const shellReady = await waitForShellReady(paneId);
+    if (!shellReady) {
+        const reason = `worker_start_shell_not_ready:${config.workerName}:${paneId}:${fingerprint}`;
+        logWorkerSpawnDiagnostic(`worker start delivery failed session=${sessionName} pane=${paneId} ` +
+            `worker=${config.workerName} cmdSha=${fingerprint} sendStatus=not_attempted reason=shell_not_ready`);
+        throw new Error(reason);
+    }
+    try {
+        // Use -l (literal) flag to prevent tmux key-name parsing of the command string.
+        const sendResult = await tmuxExecAsync([
+            'send-keys', '-t', paneId, '-l', startCmd
+        ], { timeout: 5000 });
+        logWorkerSpawnDiagnostic(`worker start send-keys literal session=${sessionName} pane=${paneId} ` +
+            `worker=${config.workerName} cmdSha=${fingerprint} sendStatus=0 stderr=${JSON.stringify(sendResult.stderr.trim())}`);
+    }
+    catch (error) {
+        logWorkerSpawnDiagnostic(`worker start send-keys literal failed session=${sessionName} pane=${paneId} ` +
+            `worker=${config.workerName} cmdSha=${fingerprint} sendStatus=1 error=${JSON.stringify(error instanceof Error ? error.message : String(error))}`);
+        throw error;
+    }
+    const delivered = await verifyWorkerStartCommandDelivered(paneId, startCmd);
+    if (!delivered) {
+        const reason = `worker_start_delivery_unverified:${config.workerName}:${paneId}:${fingerprint}`;
+        logWorkerSpawnDiagnostic(`worker start delivery verification failed session=${sessionName} pane=${paneId} ` +
+            `worker=${config.workerName} cmdSha=${fingerprint} cmdPreview=${JSON.stringify(preview)}`);
+        throw new Error(reason);
+    }
+    try {
+        const enterResult = await tmuxExecAsync(['send-keys', '-t', paneId, 'Enter'], { timeout: 5000 });
+        logWorkerSpawnDiagnostic(`worker start submit sent session=${sessionName} pane=${paneId} ` +
+            `worker=${config.workerName} cmdSha=${fingerprint} sendStatus=0 stderr=${JSON.stringify(enterResult.stderr.trim())}`);
+    }
+    catch (error) {
+        logWorkerSpawnDiagnostic(`worker start submit failed session=${sessionName} pane=${paneId} ` +
+            `worker=${config.workerName} cmdSha=${fingerprint} sendStatus=1 error=${JSON.stringify(error instanceof Error ? error.message : String(error))}`);
+        throw error;
+    }
 }
 function normalizeTmuxCapture(value) {
     return value.replace(/\r/g, '').replace(/\s+/g, ' ').trim();
 }
-async function capturePaneAsync(paneId) {
+async function capturePaneAsync(paneId, opts = {}) {
     try {
         if (isCmuxSurfaceTarget(paneId)) {
             return await cmuxCaptureSurface(paneId);
         }
-        const result = await tmuxExecAsync(['capture-pane', '-t', paneId, '-p', '-S', '-80']);
+        const args = opts.joinWrappedLines
+            ? ['capture-pane', '-J', '-t', paneId, '-p', '-S', '-80']
+            : ['capture-pane', '-t', paneId, '-p', '-S', '-80'];
+        const result = await tmuxExecAsync(args);
         return result.stdout;
     }
     catch {
